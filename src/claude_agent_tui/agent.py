@@ -62,20 +62,45 @@ class Agent:
         self.dm_history: list[dict] = []
         self.cwd: str = os.getcwd()
         self._mcp_config_path: Path = self._write_mcp_config()
+        self._hook_script_path: Path = self._write_permission_hook()
+        self._settings_path: Path = self._write_hook_settings()
         self._running_task: asyncio.Task | None = None
         self._current_is_dm: bool = False
 
     def _write_mcp_config(self) -> Path:
-        config = {
-            "mcpServers": {
-                "team-chat": {
-                    "type": "sse",
-                    "url": f"http://localhost:{PORT}/sse?agent={self.name}",
-                }
-            }
+        servers: dict = {}
+
+        # 1. Global user settings files
+        for p in [
+            Path.home() / ".claude" / "settings.json",
+            Path.home() / ".claude" / "settings.local.json",
+        ]:
+            try:
+                servers.update(json.loads(p.read_text()).get("mcpServers", {}))
+            except Exception:
+                pass
+
+        # 2. Installed Claude Code plugins (each has its own .mcp.json)
+        plugins_index = Path.home() / ".claude" / "plugins" / "installed_plugins.json"
+        try:
+            for versions in json.loads(plugins_index.read_text()).get("plugins", {}).values():
+                for install in versions:
+                    mcp_file = Path(install["installPath"]) / ".mcp.json"
+                    try:
+                        servers.update(json.loads(mcp_file.read_text()).get("mcpServers", {}))
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+        # Always include team-chat last so it can never be overridden
+        servers["team-chat"] = {
+            "type": "sse",
+            "url": f"http://localhost:{PORT}/sse?agent={self.name}",
         }
+
         path = Path(f"/tmp/claude-tui-mcp-{self.name}.json")
-        path.write_text(json.dumps(config, indent=2))
+        path.write_text(json.dumps({"mcpServers": servers}, indent=2))
         return path
 
     def _claude_path(self) -> str:
@@ -85,7 +110,6 @@ class Agent:
         return path
 
     _MCP_TOOLS = [
-        "mcp__team-chat__request_permission",
         "mcp__team-chat__claim_task",
         "mcp__team-chat__list_tasks",
         "mcp__team-chat__list_agents",
@@ -98,6 +122,55 @@ class Agent:
         "mcp__team-chat__update_status",
     ]
 
+    def _write_permission_hook(self) -> Path:
+        script = f"""\
+#!/bin/bash
+INPUT=$(cat)
+TOOL_NAME=$(echo "$INPUT" | python3 -c "import sys,json; print(json.load(sys.stdin).get('tool_name',''))" 2>/dev/null || echo "")
+
+# Auto-allow MCP tools (they have their own access control)
+if [[ "$TOOL_NAME" == mcp__* ]]; then
+    exit 0
+fi
+
+# Ask TUI for permission — blocks until user responds (up to 300s)
+RESPONSE=$(echo "$INPUT" | curl -sf --max-time 310 \\
+    -X POST "http://localhost:{PORT}/permission?agent={self.name}" \\
+    -H "Content-Type: application/json" \\
+    --data-binary @-)
+
+if [ $? -ne 0 ] || [ -z "$RESPONSE" ]; then
+    exit 0  # TUI unavailable — allow by default
+fi
+
+DECISION=$(echo "$RESPONSE" | python3 -c "import sys,json; print(json.load(sys.stdin).get('decision','allow'))" 2>/dev/null || echo "allow")
+
+[ "$DECISION" = "deny" ] && exit 2 || exit 0
+"""
+        path = Path(f"/tmp/claude-tui-hook-{self.name}.sh")
+        path.write_text(script)
+        path.chmod(0o755)
+        return path
+
+    def _write_hook_settings(self) -> Path:
+        settings = {
+            "hooks": {
+                "PreToolUse": [
+                    {
+                        "hooks": [
+                            {
+                                "type": "command",
+                                "command": str(self._hook_script_path),
+                            }
+                        ]
+                    }
+                ]
+            }
+        }
+        path = Path(f"/tmp/claude-tui-settings-{self.name}.json")
+        path.write_text(json.dumps(settings, indent=2))
+        return path
+
     def _build_cmd(self, message: str, is_first_turn: bool) -> list[str]:
         cmd = [
             self._claude_path(),
@@ -105,8 +178,9 @@ class Agent:
             "--output-format", "stream-json",
             "--verbose",
             "--mcp-config", str(self._mcp_config_path),
+            "--strict-mcp-config",
             "--allowedTools", ",".join(self._MCP_TOOLS),
-            "--permission-prompt-tool", "mcp__team-chat__request_permission",
+            "--settings", str(self._settings_path),
         ]
         if self.session_id:
             cmd += ["--resume", self.session_id]
@@ -232,7 +306,8 @@ class Agent:
         if self._running_task and not self._running_task.done():
             self._running_task.cancel()
         self.status = AgentStatus.IDLE
-        try:
-            self._mcp_config_path.unlink(missing_ok=True)
-        except Exception:
-            pass
+        for path in (self._mcp_config_path, self._hook_script_path, self._settings_path):
+            try:
+                path.unlink(missing_ok=True)
+            except Exception:
+                pass

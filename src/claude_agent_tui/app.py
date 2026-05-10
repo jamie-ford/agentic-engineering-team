@@ -63,7 +63,7 @@ class AgentTuiApp(App):
         yield Footer()
 
     def on_mount(self) -> None:
-        self.sub_title = "Ctrl+N: new agent  |  Enter on agent: DM  |  Ctrl+D: raw log  |  Ctrl+E: export"
+        self.sub_title = "Ctrl+N: new agent  |  @Name or @everyone to address  |  Enter on agent: DM  |  Ctrl+D: raw log"
         self.query_one(ComposeBar).focus_input()
         self._bus_worker = asyncio.create_task(self._drain_bus())
         self.query_one(ChatView).post_system(
@@ -184,7 +184,6 @@ class AgentTuiApp(App):
     def on_compose_bar_submitted(self, event: ComposeBar.Submitted) -> None:
         text = event.text
         chat = self.query_one(ChatView)
-        agent_list = self.query_one(AgentListWidget)
 
         if text.startswith("/task "):
             description = text[6:].strip()
@@ -194,82 +193,88 @@ class AgentTuiApp(App):
 
         chat.post_message_line("You", text, colour="white")
 
-        segments = self._split_for_agents(text, agent_list.selected_name)
-        if segments:
-            for name, segment in segments.items():
-                self._last_active_agent = name
-                asyncio.create_task(self._agents[name].send(segment))
-        elif self._agents:
-            # No target inferred — broadcast to everyone
-            for name, agent in self._agents.items():
-                asyncio.create_task(agent.send(text))
+        segments = self._split_for_agents(text)
+        for name, segment in segments.items():
+            self._last_active_agent = name
+            asyncio.create_task(self._agents[name].send(segment))
 
-    # Words that appear as connectors between agent instructions and should
-    # be stripped from the trailing edge of each segment.
-    _CONNECTOR_RE = re.compile(
-        r"[\s\-–—,;]*\b(also|and|but|then|too|additionally|plus)\b[\s\-–—,;]*$",
-        re.IGNORECASE,
-    )
+    def on_compose_bar_mention_query(self, event: ComposeBar.MentionQuery) -> None:
+        prefix = event.prefix.lower()
+        matches = [name for name in self._agents if name.lower().startswith(prefix)]
+        self.query_one(ComposeBar).set_suggestions(matches)
 
-    def _split_for_agents(self, text: str, selected: str | None) -> dict[str, str]:
-        """Return {agent_name: their_segment} for every agent named in the message.
+    _AT_RE = re.compile(r'@(\w+)', re.IGNORECASE)
 
-        For a single agent or fallback, the whole message is their segment.
-        For multiple agents, the message is split at each name boundary so
-        each agent only sees the part addressed to them.
+    def _split_for_agents(self, text: str) -> dict[str, str]:
+        """Route by @mentions.
+
+        @everyone  → full text to all agents
+        @Name      → segment to that agent (case-insensitive)
+        no mention → full text to next available agent
         """
-        # Find agent names that are used as direct addressees (at start, or after a separator).
-        # Names that appear mid-sentence (e.g. "ask Cleo about X") are subjects, not recipients.
-        lower = text.lower()
-        positions: list[tuple[int, str]] = []
-        for name in self._agents:
-            idx = lower.find(name.lower())
-            if idx == -1:
-                continue
-            if idx == 0:
-                positions.append((idx, name))
-            else:
-                prefix = text[:idx].rstrip()
-                if prefix and prefix[-1] in "-–—,;|\n":
-                    positions.append((idx, name))
+        name_map = {n.lower(): n for n in self._agents}
+        all_matches = list(self._AT_RE.finditer(text))
 
-        if not positions:
-            # No names found — fall back to last active agent, then sidebar selection
-            fallback = self._last_active_agent or selected
-            if fallback and fallback in self._agents:
-                return {fallback: text}
-            return {}
+        # @everyone → broadcast
+        if any(m.group(1).lower() == 'everyone' for m in all_matches):
+            return {name: text for name in self._agents}
 
-        if len(positions) == 1:
-            return {positions[0][1]: text}
+        # Valid @agent mentions only
+        valid = [
+            (m.start(), name_map[m.group(1).lower()], len(m.group(0)))
+            for m in all_matches
+            if m.group(1).lower() in name_map
+        ]
 
-        # Multiple agents — split at each name occurrence, sorted by position
-        positions.sort()
+        if not valid:
+            target = self._next_available_agent()
+            return {target: text} if target else {}
+
+        if len(valid) == 1:
+            pos, name, mlen = valid[0]
+            segment = text[pos + mlen:].lstrip(' ,:;').strip()
+            return {name: segment or text}
+
+        # Multiple @mentions — split text at each mention boundary
+        valid.sort()
         segments: dict[str, str] = {}
-        for i, (pos, name) in enumerate(positions):
-            end = positions[i + 1][0] if i + 1 < len(positions) else len(text)
-            raw = text[pos:end]
-            # Strip the agent's own name from the start of their segment
-            if raw.lower().startswith(name.lower()):
-                raw = raw[len(name):].lstrip(" ,:;-–—")
-            # Strip trailing connector words that belong to the next instruction
-            raw = self._CONNECTOR_RE.sub("", raw)
-            segments[name] = raw.strip(" -–—,;")
+        for i, (pos, name, mlen) in enumerate(valid):
+            end = valid[i + 1][0] if i + 1 < len(valid) else len(text)
+            segment = text[pos + mlen:end].lstrip(' ,:;').strip()
+            segments[name] = segment
         return segments
+
+    def _next_available_agent(self) -> str | None:
+        """Return the best agent to receive an unaddressed message."""
+        last = self._last_active_agent
+        # Prefer last active if they're free
+        if last in self._agents and self._agents[last].status in (AgentStatus.IDLE, AgentStatus.DONE):
+            return last
+        for name, a in self._agents.items():
+            if a.status == AgentStatus.IDLE:
+                return name
+        for name, a in self._agents.items():
+            if a.status == AgentStatus.DONE:
+                return name
+        # All busy — still route to last active or first
+        if last in self._agents:
+            return last
+        return next(iter(self._agents), None)
 
     def _enqueue_task(self, description: str) -> None:
         task = bus_mod.add_task(description)
         chat = self.query_one(ChatView)
         chat.post_system(f"📋 Task queued [{task.id}]: {description}")
-        # Nudge any agent that's idle or waiting for work
-        free = [
-            a for a in self._agents.values()
-            if a.status in (AgentStatus.IDLE, AgentStatus.DONE)
-            or (a.status == AgentStatus.BLOCKED and "waiting" in a.status_text.lower())
-        ]
-        for agent in free:
+        # Nudge exactly one free agent — when they finish the STATUS handler chains to the next task
+        free = next(
+            (a for a in self._agents.values()
+             if a.status in (AgentStatus.IDLE, AgentStatus.DONE)
+             or (a.status == AgentStatus.BLOCKED and "waiting" in a.status_text.lower())),
+            None,
+        )
+        if free:
             asyncio.create_task(
-                agent.send("New task queued. Silently call claim_task() and pick it up — no need to announce you're checking.")
+                free.send("New task queued. Silently call claim_task() and pick it up — no need to announce you're checking.")
             )
 
     # --- Actions ---
@@ -302,6 +307,7 @@ class AgentTuiApp(App):
             if self._last_active_agent == name:
                 self._last_active_agent = None
             self.query_one(ChatView).post_system(f"{name} left the team. 😢")
+            self.query_one(ComposeBar).set_suggestions([])
 
     def action_export_chat(self) -> None:
         chat = self.query_one(ChatView)

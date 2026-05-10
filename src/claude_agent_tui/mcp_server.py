@@ -39,20 +39,6 @@ def write_mcp_config() -> None:
 
 _TOOLS = [
     Tool(
-        name="request_permission",
-        description="Internal: permission prompt handler used by the TUI. Do not call directly.",
-        inputSchema={
-            "type": "object",
-            "properties": {
-                "tool_name": {"type": "string"},
-                "tool_input": {"type": "object"},
-                "tool_use_id": {"type": "string"},
-                "agent_message": {"type": "string"},
-            },
-            "additionalProperties": True,
-        },
-    ),
-    Tool(
         name="claim_task",
         description=(
             "Claim the next task from the shared team queue. "
@@ -180,26 +166,7 @@ def _make_server(agent_name: str) -> Server:
 
     @server.call_tool()
     async def call_tool(name: str, arguments: dict) -> list[TextContent]:
-        if name == "request_permission":
-            tool_name = arguments.get("tool_name", "unknown")
-            tool_input = arguments.get("tool_input", {})
-            # Session-allow shortcut — no prompt needed
-            if bus_mod.is_session_allowed(agent_name, tool_name):
-                return [TextContent(type="text", text="allow")]
-            loop = asyncio.get_event_loop()
-            future: asyncio.Future[str] = loop.create_future()
-            bus_mod.register_permission(agent_name, future)
-            await bus_mod.post(BusEvent(
-                type=EventType.PERMISSION_REQUEST,
-                agent_name=agent_name,
-                payload={"tool_name": tool_name, "tool_input": tool_input},
-            ))
-            decision = await asyncio.wait_for(future, timeout=300)
-            if decision == "allow_session":
-                bus_mod.allow_session(agent_name, tool_name)
-            return [TextContent(type="text", text=decision)]
-
-        elif name == "claim_task":
+        if name == "claim_task":
             task = bus_mod.claim_task()
             if task is None:
                 return [TextContent(type="text", text="No tasks in the queue right now.")]
@@ -310,6 +277,60 @@ def _make_server(agent_name: str) -> Server:
     return server
 
 
+async def _handle_permission(scope, receive, send) -> None:
+    """PreToolCall hook endpoint — called by per-agent hook scripts, blocks until TUI resolves."""
+    from urllib.parse import parse_qs
+
+    body = b""
+    more = True
+    while more:
+        msg = await receive()
+        body += msg.get("body", b"")
+        more = msg.get("more_body", False)
+
+    qs = parse_qs(scope.get("query_string", b"").decode())
+    agent_name = qs.get("agent", ["Unknown"])[0]
+
+    try:
+        data = json.loads(body)
+    except Exception:
+        data = {}
+
+    tool_name = data.get("tool_name", "unknown")
+    tool_input = data.get("tool_input", {})
+
+    if bus_mod.is_session_allowed(agent_name, tool_name):
+        decision = "allow"
+    else:
+        loop = asyncio.get_event_loop()
+        future: asyncio.Future[str] = loop.create_future()
+        bus_mod.register_permission(agent_name, future)
+        await bus_mod.post(BusEvent(
+            type=EventType.PERMISSION_REQUEST,
+            agent_name=agent_name,
+            payload={"tool_name": tool_name, "tool_input": tool_input},
+        ))
+        try:
+            decision = await asyncio.wait_for(future, timeout=300.0)
+        except asyncio.TimeoutError:
+            decision = "deny"
+
+    if decision == "allow_session":
+        bus_mod.allow_session(agent_name, tool_name)
+        decision = "allow"
+
+    response_body = json.dumps({"decision": decision}).encode()
+    await send({
+        "type": "http.response.start",
+        "status": 200,
+        "headers": [
+            (b"content-type", b"application/json"),
+            (b"content-length", str(len(response_body)).encode()),
+        ],
+    })
+    await send({"type": "http.response.body", "body": response_body})
+
+
 def _build_asgi_app():
     """Pure ASGI app — bypasses Starlette routing so no 'no response returned' errors."""
     sse = SseServerTransport("/messages/")
@@ -333,6 +354,9 @@ def _build_asgi_app():
 
         elif path.startswith("/messages"):
             await sse.handle_post_message(scope, receive, send)
+
+        elif path == "/permission":
+            await _handle_permission(scope, receive, send)
 
         else:
             # 404 for anything else
