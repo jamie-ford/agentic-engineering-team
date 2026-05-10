@@ -1,5 +1,7 @@
 # Claude Agent TUI
 
+> **For Claude Code:** Keep this file up to date whenever behaviour, flags, tools, commands, or architecture change. Update it as part of the same change — do not wait to be asked.
+
 A terminal UI that wraps the `claude` CLI to simulate a named software engineering team. Multiple agents run as independent Claude Code subprocess sessions, post updates to a shared team chat, and can collaborate with each other.
 
 ## Running
@@ -16,31 +18,63 @@ Requires `claude` CLI in PATH with a valid login. No API key needed — inherits
 app.py          Textual App, layout, key bindings, bus event dispatch
 agent.py        Agent class — subprocess lifecycle, session management, stream-json parsing
 bus.py          asyncio.Queue event bus + live agent registry (MCP server reads from this)
-mcp_server.py   Local SSE MCP server on localhost:18765 — team communication tools
+mcp_server.py   Local SSE MCP server on localhost:18765 — team communication + permission hook endpoint
 main.py         Entry point — starts MCP server and Textual app concurrently
 names.py        25 human name pool, colour assignment, random shuffle per session
 logger.py       Crash logging (~/.claude-tui/logs/crash-*.log), chat export on demand
 widgets/
   agent_list.py    Sidebar ListView with status icons and status text
   chat_view.py     Scrollable messenger-style bubble layout
-  bubble.py        Rich Panel bubbles — left-aligned (agent), right-aligned (you)
-  compose_bar.py   Input bar with message routing
+  bubble.py        Rich Panel bubbles + PermissionBubble for tool approval
+  compose_bar.py   Input bar with @mention routing and autocomplete
   dm_screen.py     Per-agent modal DM screen (Escape to close, Ctrl+E to export)
   agent_detail.py  Raw stream-json log modal (Ctrl+D)
 ```
 
 ## How agents work
 
-Each agent is an asyncio subprocess:
-- First turn: `claude --print --output-format stream-json --verbose --mcp-config <path> --allowedTools <mcp-tools> --append-system-prompt <prompt> <message>`
-- Follow-up turns: same flags plus `--resume <session_id>`
-- Per-agent MCP config written to `/tmp/claude-tui-mcp-{Name}.json` with `?agent=Name` query param so the shared MCP server knows which agent is calling
-- Each subprocess is spawned with `cwd=agent.cwd` so the correct `CLAUDE.md` is picked up
+Each agent is an asyncio subprocess. Three files are written to `/tmp/` at spawn time:
+
+| File | Purpose |
+|------|---------|
+| `/tmp/claude-tui-mcp-{Name}.json` | MCP config — merged from user's global settings, installed plugins, and the team-chat server |
+| `/tmp/claude-tui-hook-{Name}.sh` | `PreToolUse` hook script — calls `/permission` endpoint before each tool use |
+| `/tmp/claude-tui-settings-{Name}.json` | Claude settings file — registers the hook |
+
+**First turn:**
+```
+claude --print --output-format stream-json --verbose
+  --mcp-config /tmp/claude-tui-mcp-{Name}.json
+  --strict-mcp-config
+  --allowedTools mcp__team-chat__claim_task,...
+  --settings /tmp/claude-tui-settings-{Name}.json
+  --append-system-prompt <SYSTEM_PROMPT>
+  <message>
+```
+
+**Follow-up turns:** same flags plus `--resume <session_id>`.
+
+Each subprocess is spawned with `cwd=agent.cwd` so the correct `CLAUDE.md` is picked up. The MCP config includes:
+1. `mcpServers` from `~/.claude/settings.json` and `settings.local.json`
+2. `.mcp.json` from each installed Claude Code plugin
+3. The `team-chat` SSE server (always last, can't be overridden)
+
+## Permission system
+
+A `PreToolUse` hook fires before every tool call. The hook script:
+1. Checks the raw JSON for `"tool_name":"mcp__"` via `grep` — auto-allows all MCP tools immediately (no python3 dependency)
+2. For everything else (Bash, Edit, Write, etc.), POSTs tool info to `http://localhost:18765/permission?agent={Name}` and blocks
+3. The TUI shows a `PermissionBubble` with **Allow once / Allow session / Deny** buttons
+4. The button click resolves an asyncio Future, the endpoint returns the decision, the hook exits 0 (allow) or 2 (deny)
+
+"Allow session" remembers the decision for that agent+tool pair for the rest of the TUI session.
 
 ## MCP tools available to agents
 
 | Tool | Description |
 |------|-------------|
+| `claim_task()` | Pop the next task from the shared queue |
+| `list_tasks()` | Preview the queue without claiming |
 | `list_agents()` | Live roster — name, status, what they're working on |
 | `message_agent(agent_name, message)` | DM a teammate; their reply appears in team chat |
 | `set_working_directory(path)` | Change cwd for next turn; picks up that repo's CLAUDE.md |
@@ -52,21 +86,29 @@ Each agent is an asyncio subprocess:
 
 ## Message routing
 
-When the user types in the compose bar:
-1. Names at position 0 or after a separator (`-`, `—`, `,`, `;`) are treated as addressees
-2. Names mid-sentence (e.g. "ask **Cleo** about X") are subjects, not recipients
-3. If one agent resolved → send their segment; multiple → split at name boundaries, strip connector words
-4. If no agent resolved → fall back to last active agent, then sidebar selection
-5. If still nothing → global broadcast to all agents
+Type in the compose bar and press Enter:
+
+| Input | Behaviour |
+|-------|-----------|
+| `@Name message` | Sends to that agent only (case-insensitive, strips `@Name` from message) |
+| `@John do X @Mary do Y` | Splits at mention boundaries, each agent gets their segment |
+| `@everyone message` | Broadcasts full text to all agents |
+| `message` (no mention) | Routes to next available agent (idle → done → last active → first) |
+
+Typing `@` shows an autocomplete bar above the input with matching agent names. Click a chip to complete.
 
 ## Task queue
 
-Type `/task <description>` in the compose bar to add a task to the shared queue. Any idle agent is nudged immediately; busy agents call `claim_task()` automatically when they finish their current work.
+Type `/task <description>` to add a task. Exactly one free agent is nudged; when they finish the STATUS handler chains to the next queued task.
 
-| Tool | Behaviour |
-|------|-----------|
-| `claim_task()` | Pop the next task and return its description |
-| `list_tasks()` | Preview the queue without claiming |
+## Compose bar commands
+
+| Command | Action |
+|---------|--------|
+| `/task <description>` | Add a task to the shared queue |
+| `/run <claude args>` | Suspend TUI and run an interactive `claude` command (e.g. `/run /login`, `/run /doctor`) |
+
+`/run` works from both the main chat and DM screens.
 
 ## Key bindings
 

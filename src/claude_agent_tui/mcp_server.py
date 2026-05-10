@@ -349,8 +349,12 @@ def _build_asgi_app():
                     await server.run(
                         streams[0], streams[1], server.create_initialization_options()
                     )
-            except Exception:
-                pass  # client disconnected or protocol error — swallow silently
+            except Exception as exc:
+                # Log real errors — client disconnect is expected and silent
+                err = str(exc)
+                if err and "disconnect" not in err.lower():
+                    from . import logger
+                    logger.crash(RuntimeError(f"[MCP SSE:{agent_name}] {exc}"))
 
         elif path.startswith("/messages"):
             await sse.handle_post_message(scope, receive, send)
@@ -359,7 +363,6 @@ def _build_asgi_app():
             await _handle_permission(scope, receive, send)
 
         else:
-            # 404 for anything else
             await send({"type": "http.response.start", "status": 404, "headers": []})
             await send({"type": "http.response.body", "body": b""})
 

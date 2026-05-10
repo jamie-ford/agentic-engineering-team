@@ -70,7 +70,7 @@ class Agent:
     def _write_mcp_config(self) -> Path:
         servers: dict = {}
 
-        # 1. Global user settings files
+        # User-explicitly configured MCPs
         for p in [
             Path.home() / ".claude" / "settings.json",
             Path.home() / ".claude" / "settings.local.json",
@@ -80,7 +80,7 @@ class Agent:
             except Exception:
                 pass
 
-        # 2. Installed Claude Code plugins (each has its own .mcp.json)
+        # Installed Claude Code plugins
         plugins_index = Path.home() / ".claude" / "plugins" / "installed_plugins.json"
         try:
             for versions in json.loads(plugins_index.read_text()).get("plugins", {}).values():
@@ -126,10 +126,9 @@ class Agent:
         script = f"""\
 #!/bin/bash
 INPUT=$(cat)
-TOOL_NAME=$(echo "$INPUT" | python3 -c "import sys,json; print(json.load(sys.stdin).get('tool_name',''))" 2>/dev/null || echo "")
 
-# Auto-allow MCP tools (they have their own access control)
-if [[ "$TOOL_NAME" == mcp__* ]]; then
+# Auto-allow MCP tools — grep the raw JSON directly, no python3 dependency
+if echo "$INPUT" | grep -q '"tool_name":"mcp__'; then
     exit 0
 fi
 
@@ -234,12 +233,19 @@ DECISION=$(echo "$RESPONSE" | python3 -c "import sys,json; print(json.load(sys.s
             assert proc.stdout is not None
             assert proc.stderr is not None
 
+            _stale_session = False
+
             async def _drain_stderr():
+                nonlocal _stale_session
                 async for raw in proc.stderr:
                     line = raw.decode(errors="replace").rstrip()
-                    if line:
+                    if not line:
+                        continue
+                    if "No deferred tool marker found" in line:
+                        _stale_session = True
+                    else:
                         logger.crash(RuntimeError(f"[stderr:{self.name}] {line}"))
-                        self.stream_log.append({"type": "stderr", "text": line})
+                    self.stream_log.append({"type": "stderr", "text": line})
 
             stderr_task = asyncio.create_task(_drain_stderr())
 
@@ -257,6 +263,13 @@ DECISION=$(echo "$RESPONSE" | python3 -c "import sys,json; print(json.load(sys.s
 
             await proc.wait()
             await stderr_task
+
+            # Stale deferred-tool session — clear the session ID and retry fresh
+            if _stale_session and self.session_id:
+                self.session_id = None
+                self.status = AgentStatus.WORKING
+                await self._run_turn(message, is_first_turn=True)
+                return
 
         except asyncio.CancelledError:
             if proc and proc.returncode is None:
