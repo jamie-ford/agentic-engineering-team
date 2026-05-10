@@ -132,6 +132,13 @@ class DmScreen(ModalScreen):
         if not text:
             return
         event.input.clear()
+
+        if text.startswith("/run "):
+            args = text[5:].strip()
+            if args:
+                self.app._run_claude_interactive(args)
+            return
+
         scroll = self.query_one("#dm-scroll", VerticalScroll)
         scroll.mount(MessageBubble("You", text, from_me=True))
         scroll.scroll_end(animate=False)

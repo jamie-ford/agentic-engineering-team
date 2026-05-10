@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import re
+import shlex
+import shutil
+import subprocess
 
 from textual.app import App, ComposeResult
 from textual.binding import Binding
@@ -63,7 +66,7 @@ class AgentTuiApp(App):
         yield Footer()
 
     def on_mount(self) -> None:
-        self.sub_title = "Ctrl+N: new agent  |  @Name or @everyone to address  |  Enter on agent: DM  |  Ctrl+D: raw log"
+        self.sub_title = "Ctrl+N: new agent  |  @Name to address  |  /task  /run <claude cmd>  |  Enter: DM  Ctrl+D: log"
         self.query_one(ComposeBar).focus_input()
         self._bus_worker = asyncio.create_task(self._drain_bus())
         self.query_one(ChatView).post_system(
@@ -191,6 +194,12 @@ class AgentTuiApp(App):
                 self._enqueue_task(description)
             return
 
+        if text.startswith("/run "):
+            args = text[5:].strip()
+            if args:
+                self._run_claude_interactive(args)
+            return
+
         chat.post_message_line("You", text, colour="white")
 
         segments = self._split_for_agents(text)
@@ -260,6 +269,18 @@ class AgentTuiApp(App):
         if last in self._agents:
             return last
         return next(iter(self._agents), None)
+
+    def _run_claude_interactive(self, args: str) -> None:
+        """Suspend the TUI and run an interactive claude command in the terminal."""
+        claude = shutil.which("claude")
+        if not claude:
+            self.query_one(ChatView).post_system("claude not found in PATH")
+            return
+        self.query_one(ChatView).post_system(f"Suspending TUI → claude {args}")
+        with self.suspend():
+            print(f"\n\033[2m(Running: claude {args} — type /exit or press Ctrl+D to return to the TUI)\033[0m\n")
+            subprocess.run([claude] + shlex.split(args))
+        self.query_one(ChatView).post_system("TUI resumed.")
 
     def _enqueue_task(self, description: str) -> None:
         task = bus_mod.add_task(description)

@@ -295,6 +295,18 @@ DECISION=$(echo "$RESPONSE" | python3 -c "import sys,json; print(json.load(sys.s
             ]
             if text_parts:
                 full_text = "\n".join(text_parts)
+
+                if "Not logged in" in full_text:
+                    await bus_mod.post(BusEvent(
+                        type=EventType.STATUS,
+                        agent_name=self.name,
+                        payload={
+                            "status": "blocked",
+                            "message": "Not logged in — type `/run /login` in the TUI to authenticate",
+                        },
+                    ))
+                    return
+
                 self.dm_history.append({"role": "agent", "text": full_text})
                 await bus_mod.post(BusEvent(
                     type=EventType.DM_REPLY,
